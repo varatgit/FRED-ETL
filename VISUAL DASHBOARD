@@ -1,0 +1,350 @@
+# dashboard.py
+
+import streamlit as st
+import pandas as pd
+import psycopg2
+import plotly.express as px
+import os
+
+# --- Configuration ---
+# Use environment variables for production, or default to local values
+DB_NAME = os.getenv("DB_NAME", "fredelt")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "vardhini")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+
+# --- Custom CSS for Styling ---
+def add_custom_css():
+    """Injects a small CSS block for a clean, modern look."""
+    st.markdown("""
+        <style>
+            .main {
+                background-color: #f0f2f6; /* A very light gray background */
+            }
+            .st-emotion-cache-18ni7ap {
+                text-align: center;
+                font-size: 2.5em; /* Larger, centered header */
+            }
+            .st-emotion-cache-1v06a5r { /* Targets the main content area */
+                background-color: white;
+                padding: 1rem;
+                border-radius: 10px;
+                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); /* Subtle shadow for charts */
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+# --- Database & Data Handling ---
+@st.cache_data(ttl=3600)  # Cache the data for 1 hour to prevent re-querying on every interaction
+def load_data():
+    """Connects to the PostgreSQL database and loads the nonfarm_payrolls data."""
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST
+        )
+        st.success("✅ Database connection successful!")
+        
+        # SQL query to select all data from the table
+        query = "SELECT * FROM nonfarm_payrolls;"
+        df = pd.read_sql(query, conn)
+        
+        # Convert the 'date' column to datetime objects
+        df['date'] = pd.to_datetime(df['date'])
+        return df
+
+    except psycopg2.OperationalError as e:
+        st.error(f"❌ Database connection failed. Please check credentials and connection. Error: {e}")
+        return pd.DataFrame() # Return an empty DataFrame on failure
+    finally:
+        if conn:
+            conn.close()
+
+# --- OLAP Analysis Functions ---
+
+# --- Slicing ---
+def create_slicing_charts(df):
+    """
+    Performs slicing operations and displays results.
+    Slicing is the process of picking a specific dimension and creating a sub-cube.
+    """
+    st.header("Slicing Analysis ✂️")
+    st.markdown("Slicing allows us to look at a single 'slice' of the data.")
+    
+    st.subheader("Question 1: Average payroll employment by calendar year (2010–2025)")
+    st.markdown("We 'slice' the data to view only the average employment per year within a specific date range.")
+    
+    # SQL logic for this operation
+    st.expander("Show SQL Logic")
+    st.code("""
+        SELECT
+            EXTRACT(YEAR FROM date) as year,
+            AVG(total_employment) as avg_employment
+        FROM nonfarm_payrolls
+        WHERE EXTRACT(YEAR FROM date) BETWEEN 2010 AND 2025
+        GROUP BY year
+        ORDER BY year;
+    """, language="sql")
+    
+    # Pandas implementation
+    df_slice_q1 = df[(df['date'].dt.year >= 2010) & (df['date'].dt.year <= 2025)]
+    yearly_avg = df_slice_q1.groupby(df_slice_q1['date'].dt.year)['total_employment'].mean().reset_index()
+    yearly_avg.rename(columns={'date': 'Year', 'total_employment': 'Avg. Employment'}, inplace=True)
+    
+    fig1 = px.bar(yearly_avg, x='Year', y='Avg. Employment', 
+                  title='Average Payroll Employment by Year (2010-2025)',
+                  labels={'Year': 'Calendar Year', 'Avg. Employment': 'Average Employment (in thousands)'})
+    st.plotly_chart(fig1, use_container_width=True)
+    st.dataframe(yearly_avg.style.format({'Avg. Employment': "{:,.0f}"}), use_container_width=True)
+
+    st.subheader("Question 2: Monthly employment levels from March–December 2020 vs. 2019")
+    st.markdown("This slice isolates the data to a specific month and year range to compare pandemic-era employment to the prior year.")
+    
+    # SQL logic for this operation
+    st.expander("Show SQL Logic")
+    st.code("""
+        SELECT
+            EXTRACT(MONTH FROM date) as month,
+            EXTRACT(YEAR FROM date) as year,
+            total_employment
+        FROM nonfarm_payrolls
+        WHERE (EXTRACT(YEAR FROM date) = 2020 OR EXTRACT(YEAR FROM date) = 2019)
+          AND EXTRACT(MONTH FROM date) BETWEEN 3 AND 12
+        ORDER BY year, month;
+    """, language="sql")
+    
+    # Pandas implementation
+    df_slice_q2 = df[(df['date'].dt.year.isin([2019, 2020])) & (df['date'].dt.month.isin(range(3, 13)))]
+    
+    fig2 = px.line(df_slice_q2, x=df_slice_q2['date'].dt.strftime('%b'), y='total_employment', color=df_slice_q2['date'].dt.year.astype(str),
+                   title='Monthly Employment: March-Dec 2020 vs. 2019',
+                   labels={'x': 'Month', 'total_employment': 'Total Employment (in thousands)', 'color': 'Year'})
+    st.plotly_chart(fig2, use_container_width=True)
+    st.dataframe(df_slice_q2[['date', 'total_employment']].style.format({'total_employment': "{:,.0f}"}), use_container_width=True)
+
+# --- Dicing ---
+def create_dicing_charts(df):
+    """
+    Performs dicing operations and displays results.
+    Dicing involves selecting a sub-cube of the data across multiple dimensions.
+    """
+    st.header("Dicing Analysis 🎲")
+    st.markdown("Dicing is like 'slicing' but across multiple dimensions, creating a smaller sub-cube of data.")
+    
+    st.subheader("Question 1: Months with >2% drop, and recovery time")
+    st.markdown("This dicer filters for months meeting a specific condition (a sharp drop) and then analyzes a subset of the data.")
+    
+    # Pandas implementation
+    df_dice_q1 = df.copy()
+    df_dice_q1['monthly_change'] = df_dice_q1['total_employment'].pct_change()
+    
+    sharp_drops = df_dice_q1[df_dice_q1['monthly_change'] < -0.02].copy()
+    
+    st.write("Months with a month-over-month employment drop of more than 2%:")
+    st.dataframe(sharp_drops[['date', 'total_employment', 'monthly_change']].style.format({
+        'total_employment': "{:,.0f}",
+        'monthly_change': "{:.2%}"
+    }), use_container_width=True)
+
+    # Calculate recovery time for each drop
+    st.markdown("#### Time to recover to prior peak employment:")
+    recovery_data = []
+    
+    for _, row in sharp_drops.iterrows():
+        drop_date = row['date']
+        drop_employment = row['total_employment']
+        
+        # Find the peak employment before the drop
+        prior_data = df_dice_q1[df_dice_q1['date'] < drop_date]
+        if prior_data.empty:
+            continue
+        prior_peak = prior_data['total_employment'].max()
+        
+        # Find the first month after the drop that surpassed the prior peak
+        post_data = df_dice_q1[df_dice_q1['date'] >= drop_date]
+        recovery_month = post_data[post_data['total_employment'] >= prior_peak].first_valid_index()
+        
+        if recovery_month:
+            recovery_date = df_dice_q1.loc[recovery_month, 'date']
+            months_to_recover = (recovery_date.year - drop_date.year) * 12 + recovery_date.month - drop_date.month
+            recovery_data.append({
+                'Drop Month': drop_date.strftime('%Y-%m'),
+                'Prior Peak Employment': prior_peak,
+                'Recovery Month': recovery_date.strftime('%Y-%m'),
+                'Months to Recover': months_to_recover
+            })
+    
+    if recovery_data:
+        recovery_df = pd.DataFrame(recovery_data)
+        st.dataframe(recovery_df, use_container_width=True)
+    else:
+        st.info("No recovery data available for the identified drops.")
+
+    st.subheader("Question 2: Highest payroll growth month in Q4 (Oct-Dec) of each year")
+    st.markdown("This dices the data by filtering for a specific quarter (Q4) and then groups to find the month with the highest growth.")
+    
+    # Pandas implementation
+    df_dice_q2 = df.copy()
+    df_dice_q2['monthly_growth'] = df_dice_q2['total_employment'].diff()
+    df_dice_q2['year'] = df_dice_q2['date'].dt.year
+    df_dice_q2['month'] = df_dice_q2['date'].dt.month
+    
+    q4_df = df_dice_q2[df_dice_q2['month'].isin([10, 11, 12])]
+    
+    highest_growth_q4 = q4_df.loc[q4_df.groupby('year')['monthly_growth'].idxmax()]
+    
+    fig = px.bar(highest_growth_q4, x='year', y='monthly_growth', color='month', 
+                 title='Highest Payroll Growth Month in Q4 by Year',
+                 labels={'year': 'Year', 'monthly_growth': 'Monthly Growth (in thousands)', 'month': 'Month (10=Oct, 11=Nov, 12=Dec)'},
+                 text=highest_growth_q4['date'].dt.strftime('%b'))
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.dataframe(highest_growth_q4[['date', 'monthly_growth']].style.format({'monthly_growth': "{:,.0f}"}), use_container_width=True)
+
+# --- Roll-up ---
+def create_rollup_charts(df):
+    """
+    Performs roll-up operations and displays results.
+    Roll-up involves aggregating data to a higher level of a dimensional hierarchy.
+    """
+    st.header("Roll-up Analysis 📈")
+    st.markdown("Roll-up aggregates data from a more detailed level to a higher, more summarized level.")
+    
+    st.subheader("Question 1: Total payroll by quarter and year with growth rates")
+    st.markdown("We roll up the data from monthly to quarterly and then to yearly totals.")
+    
+    # SQL logic for this operation
+    st.expander("Show SQL Logic")
+    st.code("""
+        WITH quarterly_data AS (
+            SELECT
+                EXTRACT(YEAR FROM date) as year,
+                EXTRACT(QUARTER FROM date) as quarter,
+                SUM(total_employment) as quarterly_employment
+            FROM nonfarm_payrolls
+            GROUP BY year, quarter
+        )
+        SELECT
+            *,
+            (quarterly_employment - LAG(quarterly_employment, 1) OVER (ORDER BY year, quarter)) / LAG(quarterly_employment, 1) OVER (ORDER BY year, quarter) as qoq_growth_rate,
+            (quarterly_employment - LAG(quarterly_employment, 4) OVER (ORDER BY year, quarter)) / LAG(quarterly_employment, 4) OVER (ORDER BY year, quarter) as yoy_growth_rate
+        FROM quarterly_data;
+    """, language="sql")
+    
+    # Pandas implementation
+    df_rollup_q1 = df.copy()
+    df_rollup_q1['year_quarter'] = df_rollup_q1['date'].dt.to_period('Q')
+    quarterly_data = df_rollup_q1.groupby('year_quarter')['total_employment'].sum().reset_index()
+    quarterly_data['quarterly_employment'] = quarterly_data['total_employment']
+    quarterly_data.drop('total_employment', axis=1, inplace=True)
+    
+    quarterly_data['qoq_growth_rate'] = quarterly_data['quarterly_employment'].pct_change()
+    quarterly_data['yoy_growth_rate'] = quarterly_data['quarterly_employment'].pct_change(periods=4)
+    
+    st.subheader("Quarter-over-Quarter and Year-over-Year Growth Rates")
+    st.dataframe(quarterly_data.style.format({
+        'quarterly_employment': "{:,.0f}",
+        'qoq_growth_rate': "{:.2%}",
+        'yoy_growth_rate': "{:.2%}"
+    }), use_container_width=True)
+    
+    fig = px.line(quarterly_data.dropna(), x='year_quarter', y=['qoq_growth_rate', 'yoy_growth_rate'], 
+                  title='Quarterly and Yearly Employment Growth Rates',
+                  labels={'year_quarter': 'Year-Quarter', 'value': 'Growth Rate', 'variable': 'Type'})
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Question 2: Compare average employment in the 2010s vs. the 2000s")
+    st.markdown("We roll up the data to a decade level to compare average employment.")
+    
+    # Pandas implementation
+    df_rollup_q2 = df.copy()
+    df_rollup_q2['decade'] = df_rollup_q2['date'].dt.year.apply(lambda x: f"{x // 10 * 10}s")
+    decade_avg = df_rollup_q2.groupby('decade')['total_employment'].mean().reset_index()
+    
+    fig = px.bar(decade_avg, x='decade', y='total_employment', 
+                 title='Average Payroll Employment by Decade',
+                 labels={'decade': 'Decade', 'total_employment': 'Avg. Employment (in thousands)'})
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.dataframe(decade_avg.style.format({'total_employment': "{:,.0f}"}), use_container_width=True)
+
+# --- Drill-down ---
+def create_drilldown_charts(df):
+    """
+    Performs drill-down operations and displays results.
+    Drill-down goes from a summarized level to a more detailed level.
+    """
+    st.header("Drill-Down Analysis 🔍")
+    st.markdown("Drill-down moves from a high-level summary to a more granular view.")
+    
+    st.subheader("Question 1: Months contributing most to the highest annual employment gain")
+    st.markdown("We first find the year with the largest gain (roll-up) and then drill-down to see the monthly contributions.")
+    
+    # Pandas implementation
+    df_drill_q1 = df.copy()
+    df_drill_q1['annual_gain'] = df_drill_q1['total_employment'].diff(periods=12)
+    
+    # Find the year with the maximum annual gain
+    annual_gains = df_drill_q1.groupby(df_drill_q1['date'].dt.year)['annual_gain'].sum()
+    max_gain_year = annual_gains.idxmax()
+    
+    st.write(f"The year with the highest total annual employment gain was **{max_gain_year}**.")
+    
+    # Drill-down into that specific year's monthly data
+    yearly_data = df_drill_q1[df_drill_q1['date'].dt.year == max_gain_year]
+    yearly_data['monthly_change'] = yearly_data['total_employment'].diff()
+    
+    fig = px.bar(yearly_data, x=yearly_data['date'].dt.strftime('%b'), y='monthly_change', 
+                 title=f'Monthly Employment Change in {max_gain_year}',
+                 labels={'x': 'Month', 'monthly_change': 'Monthly Change (in thousands)'})
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.dataframe(yearly_data[['date', 'monthly_change']].dropna().style.format({
+        'monthly_change': "{:,.0f}"
+    }), use_container_width=True)
+    
+    st.subheader("Question 2: Identify the month with the sharpest drop and explain data limitation")
+    st.markdown("We find the month with the largest negative month-over-month change.")
+    
+    # Pandas implementation
+    df_drill_q2 = df.copy()
+    df_drill_q2['monthly_change'] = df_drill_q2['total_employment'].diff()
+    sharpest_drop_month = df_drill_q2.loc[df_drill_q2['monthly_change'].idxmin()]
+    
+    st.write(f"The sharpest drop occurred in **{sharpest_drop_month['date'].strftime('%B %Y')}** with a change of **{sharpest_drop_month['monthly_change']:,.0f}** thousand jobs.")
+    
+    st.info("""
+    **Explanation of Data Limitation:**
+    The dataset is a **monthly** series. Therefore, a drill-down to a **weekly** or **daily** breakdown is not possible with this data. The most granular level available is the monthly total, and any further drill-down would require a different, more granular dataset.
+    """)
+
+# --- Main Application Logic ---
+def main():
+    """Main function to run the Streamlit app."""
+    add_custom_css()
+
+    st.sidebar.title("Navigation 🧭")
+    analysis_type = st.sidebar.radio(
+        "Choose an OLAP Operation",
+        ('Slicing', 'Dicing', 'Roll-up', 'Drill-Down')
+    )
+
+    st.title("Non-Farm Payrolls OLAP Dashboard 📊")
+
+    # Load data and proceed only if successful
+    df = load_data()
+    if not df.empty:
+        if analysis_type == 'Slicing':
+            create_slicing_charts(df)
+        elif analysis_type == 'Dicing':
+            create_dicing_charts(df)
+        elif analysis_type == 'Roll-up':
+            create_rollup_charts(df)
+        elif analysis_type == 'Drill-Down':
+            create_drilldown_charts(df)
+
+if __name__ == "__main__":
+    main()
